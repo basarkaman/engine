@@ -1,0 +1,6 @@
+# Renderer ve loader fonksiyonları doğası gereği çok parametre alır
+too-many-arguments-threshold = 8
+
+# bytemuck Pod struct'ları, wgpu descriptor'ları vs. için
+# wgpu/cgmath zincirleri uzun olabiliyor
+cognitive-complexity-threshold = 30
