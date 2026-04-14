@@ -1,22 +1,37 @@
 name: Rust
-
 on:
   push:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
-
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build release binary
+      run: cargo build --release --verbose
+
+    - name: Update continuous release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: continuous
+        name: continuous
+        prerelease: true
+        files: target/release/<binary-adi>
