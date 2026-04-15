@@ -9,7 +9,7 @@ use winit::{event_loop::ActiveEventLoop, keyboard::KeyCode, window::Window};
 use crate::app::Config;
 use crate::camera::{Camera, CameraUniform, OPENGL_TO_WGPU_MATRIX};
 use crate::frustum::Frustum;
-use crate::game::{DirectionalLight, Flashlight, ModelTag, PointLight, Position};
+use crate::game::{DirectionalLight, Flashlight, ModelTag, PointLight, Position, Rotation};
 use crate::instance::{InstanceRaw, build_instance_data_for};
 use crate::model::{DrawModel, Vertex};
 use crate::resources;
@@ -43,12 +43,8 @@ struct LightSpaceUniform {
 /// Actual capacity is always rounded up to the next power of two.
 const MIN_CAPACITY: u32 = 64;
 
-// Shadow map configuration — tweak these to cover your scene.
-const SHADOW_MAP_SIZE:  u32  = 2048;
-const SHADOW_ORTHO_SIZE: f32 = 2000.0; // half-extent of the ortho frustum (world units)
-const SHADOW_LIGHT_DIST: f32 = 5000.0; // how far back the shadow camera sits
-const SHADOW_ZNEAR: f32      = 3000.0; // near clip of the shadow camera
-const SHADOW_ZFAR:  f32      = 8000.0; // far  clip of the shadow camera
+// Shadow map resolution — higher = sharper shadows, more memory.
+const SHADOW_MAP_SIZE: u32 = 2048;
 
 /// Per-model GPU resources and current instance count.
 struct ModelEntry {
@@ -604,8 +600,9 @@ impl State {
             .next()
             .map(|(_, dl)| dl.direction)
             .unwrap_or_else(|| cgmath::vec3(0.4, 1.0, 0.3));
+        let (init_center, init_radius) = Self::compute_scene_bounds(&models, &world);
         let init_ls = LightSpaceUniform {
-            matrix: Self::compute_light_space_matrix(init_dir).into(),
+            matrix: Self::compute_light_space_matrix(init_dir, init_center, init_radius).into(),
         };
         let light_space_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("light_space_buffer"),
@@ -962,27 +959,90 @@ impl State {
         }
     }
 
-    /// Builds the orthographic light-space matrix used by both render passes.
+    /// Computes a conservative world-space bounding sphere enclosing all mesh instances.
+    /// Iterates every (ModelTag, Position, Rotation) entity, transforms each mesh's local
+    /// bounding sphere into world space, then returns the AABB-derived enclosing sphere.
+    /// Falls back to (origin, 100) when the world contains no renderable geometry.
+    fn compute_scene_bounds(
+        models: &HashMap<String, ModelEntry>,
+        world: &World,
+    ) -> (cgmath::Point3<f32>, f32) {
+        use cgmath::Transform;
+
+        let mut min = cgmath::point3( f32::MAX,  f32::MAX,  f32::MAX);
+        let mut max = cgmath::point3(-f32::MAX, -f32::MAX, -f32::MAX);
+        let mut found_any = false;
+
+        for (tag, entry) in models {
+            // Collect all instance transforms for this model tag.
+            let transforms: Vec<cgmath::Matrix4<f32>> = world
+                .query::<(&Position, &Rotation, &ModelTag)>()
+                .iter()
+                .filter(|(_, (_, _, t))| t.0 == tag.as_str())
+                .map(|(_, (pos, rot, _))| {
+                    cgmath::Matrix4::from_translation(pos.0) * cgmath::Matrix4::from(rot.0)
+                })
+                .collect();
+
+            for mesh in &entry.model.meshes {
+                let (center_local, radius) = mesh.bounding_sphere;
+                for m in &transforms {
+                    // Rotation preserves radius; translation shifts center.
+                    let c: cgmath::Point3<f32> = m.transform_point(center_local);
+                    min.x = min.x.min(c.x - radius);
+                    min.y = min.y.min(c.y - radius);
+                    min.z = min.z.min(c.z - radius);
+                    max.x = max.x.max(c.x + radius);
+                    max.y = max.y.max(c.y + radius);
+                    max.z = max.z.max(c.z + radius);
+                    found_any = true;
+                }
+            }
+        }
+
+        if !found_any {
+            return (cgmath::point3(0.0, 0.0, 0.0), 100.0);
+        }
+
+        let center = cgmath::point3(
+            (min.x + max.x) * 0.5,
+            (min.y + max.y) * 0.5,
+            (min.z + max.z) * 0.5,
+        );
+        let dx = max.x - min.x;
+        let dy = max.y - min.y;
+        let dz = max.z - min.z;
+        let radius = (dx * dx + dy * dy + dz * dz).sqrt() * 0.5;
+
+        (center, radius)
+    }
+
+    /// Builds the orthographic light-space matrix fitted to the scene's bounding sphere.
     /// `direction` points **toward** the light source (same convention as `DirectionalLight`).
-    fn compute_light_space_matrix(direction: cgmath::Vector3<f32>) -> cgmath::Matrix4<f32> {
+    /// The shadow camera is placed 2× `scene_radius` behind `scene_center` along `direction`,
+    /// so the entire scene fits inside the ortho frustum regardless of model scale.
+    fn compute_light_space_matrix(
+        direction: cgmath::Vector3<f32>,
+        scene_center: cgmath::Point3<f32>,
+        scene_radius: f32,
+    ) -> cgmath::Matrix4<f32> {
         use cgmath::InnerSpace;
         let dir = direction.normalize();
-        // Place the shadow camera behind the scene along the light direction.
-        let p = dir * SHADOW_LIGHT_DIST;
-        let eye = cgmath::Point3::new(p.x, p.y, p.z);
-        let target = cgmath::Point3::new(0.0, 0.0, 0.0);
-        // Avoid a degenerate up vector when the light is almost straight down.
+        // Push the shadow camera back far enough that the whole scene is in front of it.
+        let dist = scene_radius * 2.0;
+        let eye = scene_center + dir * dist;
+        // Avoid a degenerate up vector when the light points straight up or down.
         let up = if dir.y.abs() > 0.99 {
             cgmath::Vector3::unit_z()
         } else {
             cgmath::Vector3::unit_y()
         };
-        let view = cgmath::Matrix4::look_at_rh(eye, target, up);
-        let proj = cgmath::ortho(
-            -SHADOW_ORTHO_SIZE,  SHADOW_ORTHO_SIZE,
-            -SHADOW_ORTHO_SIZE,  SHADOW_ORTHO_SIZE,
-             SHADOW_ZNEAR,       SHADOW_ZFAR,
-        );
+        let view = cgmath::Matrix4::look_at_rh(eye, scene_center, up);
+        // 5 % margin so geometry exactly at the sphere edge isn't clipped.
+        let half  = scene_radius * 1.05;
+        let znear = (dist - scene_radius).max(0.01);
+        let zfar  = dist + scene_radius;
+        let proj = cgmath::ortho(-half, half, -half, half, znear, zfar);
         // OPENGL_TO_WGPU_MATRIX remaps Z from [-1,1] → [0,1] for wgpu.
         OPENGL_TO_WGPU_MATRIX * proj * view
     }
@@ -1079,8 +1139,9 @@ impl State {
             });
         self.queue.write_buffer(&self.dir_light_buffer, 0, bytemuck::cast_slice(&[dir_uniform]));
 
+        let (scene_center, scene_radius) = Self::compute_scene_bounds(&self.models, &self.world);
         let ls = LightSpaceUniform {
-            matrix: Self::compute_light_space_matrix(dir).into(),
+            matrix: Self::compute_light_space_matrix(dir, scene_center, scene_radius).into(),
         };
         self.queue.write_buffer(
             &self.light_space_buffer, 0,
