@@ -39,6 +39,10 @@ struct LightSpaceUniform {
     matrix: [[f32; 4]; 4],
 }
 
+/// Minimum number of instance slots allocated per model buffer.
+/// Actual capacity is always rounded up to the next power of two.
+const MIN_CAPACITY: u32 = 64;
+
 // Shadow map configuration — tweak these to cover your scene.
 const SHADOW_MAP_SIZE:  u32  = 2048;
 const SHADOW_ORTHO_SIZE: f32 = 2000.0; // half-extent of the ortho frustum (world units)
@@ -50,7 +54,11 @@ const SHADOW_ZFAR:  f32      = 8000.0; // far  clip of the shadow camera
 struct ModelEntry {
     model: crate::model::Model,
     instance_buffer: wgpu::Buffer,
+    /// Number of instances currently written into the buffer.
     instance_count: u32,
+    /// Allocated capacity of `instance_buffer` in instances.
+    /// The buffer is recreated (doubled) when `instance_count` exceeds this.
+    instance_capacity: u32,
 }
 
 pub struct State {
@@ -298,12 +306,19 @@ impl State {
                 .unwrap();
             let instance_data = build_instance_data_for(&world, tag);
             let instance_count = instance_data.len() as u32;
-            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            // Allocate at least MIN_CAPACITY slots, rounded to the next power of two,
+            // so the buffer can absorb runtime spawns without immediate reallocation.
+            let instance_capacity = instance_count.max(MIN_CAPACITY).next_power_of_two();
+            let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(tag.as_str()),
-                contents: bytemuck::cast_slice(&instance_data),
+                size: (instance_capacity as usize * std::mem::size_of::<InstanceRaw>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
-            models.insert(tag.clone(), ModelEntry { model, instance_buffer, instance_count });
+            if !instance_data.is_empty() {
+                queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&instance_data));
+            }
+            models.insert(tag.clone(), ModelEntry { model, instance_buffer, instance_count, instance_capacity });
         }
 
         let camera_bind_group_layout =
@@ -866,6 +881,12 @@ impl State {
         &self.window
     }
 
+    /// Mutable access to the ECS world so game code can spawn or despawn entities at runtime.
+    /// After calling this, the instance buffers will be updated automatically on the next frame.
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -1068,12 +1089,28 @@ impl State {
 
         for (tag, entry) in &mut self.models {
             let instance_data = build_instance_data_for(&self.world, tag);
-            entry.instance_count = instance_data.len() as u32;
-            self.queue.write_buffer(
-                &entry.instance_buffer,
-                0,
-                bytemuck::cast_slice(&instance_data),
-            );
+            let count = instance_data.len() as u32;
+
+            // Grow the buffer when the entity count exceeds current capacity.
+            if count > entry.instance_capacity {
+                let new_cap = count.next_power_of_two();
+                entry.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(tag.as_str()),
+                    size: (new_cap as usize * std::mem::size_of::<InstanceRaw>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                entry.instance_capacity = new_cap;
+            }
+
+            entry.instance_count = count;
+            if !instance_data.is_empty() {
+                self.queue.write_buffer(
+                    &entry.instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&instance_data),
+                );
+            }
         }
     }
 
